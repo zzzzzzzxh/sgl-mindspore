@@ -4,7 +4,7 @@ import logging
 import math
 import os
 from functools import lru_cache
-from typing import Iterable, Optional, Tuple, Type, Union
+from typing import Iterable, List, Optional, Tuple
 
 import mindspore as ms
 import mindspore.common.dtype as mstype
@@ -175,7 +175,7 @@ class Qwen3Attention(nn.Cell):
 
     def construct(
         self,
-        hidden_state: Tensor,
+        hidden_states: Tensor,
         positions: Tensor,
         batch_valid_length: Tensor,
         is_prefill: bool,
@@ -187,9 +187,9 @@ class Qwen3Attention(nn.Cell):
         out_cache_loc: Tensor,
         block_tables: Tensor,
     ) -> Tensor:
-        token_lens, hidden_dim = hidden_state.shape
+        token_lens, hidden_dim = hidden_states.shape
 
-        qkv = self.qkv_proj(hidden_state)
+        qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split(
             [
                 self.q_size // self.tp_size,
@@ -276,7 +276,7 @@ class Qwen3DecoderLayer(nn.Cell):
 
     def construct(
         self,
-        hidden_state: Tensor,
+        hidden_states: Tensor,
         residual: Tensor,
         positions: Tensor,
         batch_valid_length: Tensor,
@@ -290,12 +290,12 @@ class Qwen3DecoderLayer(nn.Cell):
         block_tables: Tensor,
     ) -> Tuple[Tensor, Tensor]:
         if residual is None:
-            residual = hidden_state
-            hidden_state = self.input_layernorm(hidden_state)
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_state, residual = self.input_layernorm(hidden_state, residual)
-        hidden_state = self.self_attn(
-            hidden_state=hidden_state,
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
             positions=positions,
             batch_valid_length=batch_valid_length,
             is_prefill=is_prefill,
@@ -307,10 +307,10 @@ class Qwen3DecoderLayer(nn.Cell):
             out_cache_loc=out_cache_loc,
             block_tables=block_tables,
         )
-        hidden_state, residual = self.post_attention_layernorm(hidden_state, residual)
-        hidden_state = self.mlp(hidden_state)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
 
-        return hidden_state, residual
+        return hidden_states, residual
 
 
 class Qwen3Model(nn.Cell):
@@ -336,6 +336,7 @@ class Qwen3Model(nn.Cell):
         )
 
         self.layers = nn.CellList()
+        self.layers_to_capture = []
 
         for i in range(self.num_hidden_layers):
             layer = Qwen3DecoderLayer(
@@ -370,12 +371,17 @@ class Qwen3Model(nn.Cell):
         """
         Forward of qwen model.
         """
-        hidden_state = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids)
         residual = None
+        aux_hidden_states = []
         for i in range(self.num_hidden_layers):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[i]
-            hidden_state, residual = layer(
-                hidden_state=hidden_state,
+            hidden_states, residual = layer(
+                hidden_states=hidden_states,
                 residual=residual,
                 positions=position_ids,
                 batch_valid_length=batch_valid_length,
@@ -389,9 +395,12 @@ class Qwen3Model(nn.Cell):
                 block_tables=block_tables,
             )
 
-        hidden_state, _ = self.norm(hidden_state, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_state
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class GatherLastDim(nn.Cell):
@@ -439,11 +448,19 @@ class Qwen3ForCausalLM(MindSporeModelBase):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.all_gather = GatherLastDim()
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
         # for best performance of MindSpore for Qwen3
         os.environ["MS_INTERNAL_DISABLE_CUSTOM_KERNEL_LIST"] = (
             "FlashAttentionScore,PagedAttention"
         )
         os.environ["MS_DISABLE_INTERNAL_KERNELS_LIST"] = "RmsNorm"
+
+    def prepare_inputs(self, forward_batch, model_inputs):
+        if forward_batch.capture_hidden_mode:
+            model_inputs["capture_hidden_mode"] = forward_batch.capture_hidden_mode
+        return model_inputs
 
     def set_model_inputs(self, is_prefill):
         dyn_input_ids = Tensor(shape=[None], dtype=dtype.int32)
@@ -536,6 +553,10 @@ class Qwen3ForCausalLM(MindSporeModelBase):
     def construct(self, **model_inputs) -> Tensor:
         q_seq_lens = model_inputs["q_seq_lens"]
         is_prefill = model_inputs["is_prefill"]
+        if "capture_hidden_mode" in model_inputs:
+            capture_hidden_mode = model_inputs["capture_hidden_mode"]
+        if "forward_mode" in model_inputs:
+            forward_mode = model_inputs["forward_mode"]
 
         if self.prev_prefill != is_prefill:
             self.set_model_inputs(is_prefill)
@@ -546,17 +567,74 @@ class Qwen3ForCausalLM(MindSporeModelBase):
         else:
             self.model.phase = "increment"
 
-        hidden_state = self.model(**model_inputs)
+        hidden_states = self.model(**model_inputs)
+
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+            if capture_hidden_mode.need_capture():
+                if capture_hidden_mode.is_full():
+                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
+                elif capture_hidden_mode.is_last():
+                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
+                    aux_hidden_states = mint.index_select(
+                        aux_hidden_states, 0, mint.cumsum(q_seq_lens, 0) - 1
+                    )
+                else:
+                    assert False, "Unsupported capture hidden mode"
 
         # TODO: In pure decode scenarios, cumsum and gather operations will be redundant .
         q_seq_lens = mint.cumsum(q_seq_lens, 0)
-        hidden_state = mint.index_select(hidden_state, 0, q_seq_lens - 1)
+        if not forward_mode.is_target_verify():
+            # In target verify mode, all tokens' logits are needed.
+            hidden_states = mint.index_select(hidden_states, 0, q_seq_lens - 1)
 
-        logits = self.lm_head(hidden_state)
+        logits = self.lm_head(hidden_states)
         if self.tp_size:
             logits = self.all_gather(logits)
         logits = mint.reshape(logits, (-1, logits.shape[-1]))
-        return logits
+
+        if self.capture_aux_hidden_states:
+            return logits, aux_hidden_states
+        else:
+            return logits
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        ms.runtime.empty_cache()
+        ms.runtime.synchronize()
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        ms.runtime.empty_cache()
+        ms.runtime.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Qwen3ForCausalLM
