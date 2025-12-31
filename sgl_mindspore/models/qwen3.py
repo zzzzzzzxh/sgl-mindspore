@@ -553,6 +553,12 @@ class Qwen3ForCausalLM(MindSporeModelBase):
     def construct(self, **model_inputs) -> Tensor:
         q_seq_lens = model_inputs["q_seq_lens"]
         is_prefill = model_inputs["is_prefill"]
+        print(f"[Qwen3ForCausalLM] is_prefill: {is_prefill}, q_seq_lens: {q_seq_lens}")
+        if "hidden_states" in model_inputs:
+            print(
+                f"[Qwen3ForCausalLM] has hidden_states: {model_inputs['hidden_states'].shape}"
+            )
+
         if "capture_hidden_mode" in model_inputs:
             capture_hidden_mode = model_inputs.pop("capture_hidden_mode")
         if "forward_mode" in model_inputs:

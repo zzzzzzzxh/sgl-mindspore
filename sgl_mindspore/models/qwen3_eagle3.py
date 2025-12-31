@@ -159,6 +159,12 @@ class Qwen3ModelEagle3(nn.Cell):
         out_cache_loc=None,
         block_tables=None,
     ):
+        print(f"[Qwen3ModelEagle3] construct called. is_prefill={is_prefill}")
+        if hidden_states is not None:
+            print(f"[Qwen3ModelEagle3] hidden_states shape: {hidden_states.shape}")
+        else:
+            print("[Qwen3ModelEagle3] hidden_states is None")
+
         embeds = self.embed_tokens(input_ids)
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
@@ -166,6 +172,11 @@ class Qwen3ModelEagle3(nn.Cell):
         # idle batch
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
+
+        print(
+            f"[Qwen3ModelEagle3] hidden_states shape: {hidden_states.shape}, embeds shape: {embeds.shape}"
+        )
+        print(f"[Qwen3ModelEagle3] is_prefill: {is_prefill}")
 
         residual = None
         hidden_states, residual = self.midlayer(
@@ -293,12 +304,197 @@ class LlamaForCausalLMEagle3(Qwen3ForCausalLM):
 
     def prepare_inputs(self, forward_batch: ForwardBatch, model_inputs: Dict[str, Any]):
         if forward_batch.spec_info:
+            print(
+                f"[LlamaForCausalLMEagle3] prepare_inputs: Found spec_info. hidden_states shape: {forward_batch.spec_info.hidden_states.shape}"
+            )
             model_inputs["hidden_states"] = tensor_torch2ms(
                 forward_batch.spec_info.hidden_states
             )
+        else:
+            print("[LlamaForCausalLMEagle3] prepare_inputs: No spec_info found.")
+
+        # Handle the case where hidden_states might be missing in some spec decoding steps
+        # We need to ensure hidden_states is always present for MindSpore graph compilation
+        # even if it's a dummy tensor when not strictly needed by logic but required by signature.
+        # However, for Eagle, it seems hidden_states IS required.
+        # If spec_info is None, we must provide a dummy hidden_states to match the set_inputs signature.
+        if "hidden_states" not in model_inputs:
+            target_hidden_size = self.config.hidden_size
+            if hasattr(self.config, "target_hidden_size"):
+                target_hidden_size = self.config.target_hidden_size
+            # Create a dummy tensor with correct shape (0, hidden_size) or (1, hidden_size) depending on batch
+            # Using (0, hidden_size) might be safer for concatenation logic if any
+            # But here we probably just need a placeholder that matches the dtype and shape rank
+            model_inputs["hidden_states"] = Tensor(
+                shape=(0, target_hidden_size), dtype=self.config.param_dtype
+            )
+
         if forward_batch.capture_hidden_mode:
             model_inputs["capture_hidden_mode"] = forward_batch.capture_hidden_mode
         return model_inputs
+
+    def set_model_inputs(self, is_prefill):
+        dyn_input_ids = Tensor(shape=[None], dtype=dtype.int32)
+        dyn_position_ids = Tensor(shape=[None], dtype=dtype.int64)
+
+        head_size = self.config.head_dim
+        # use pa, if use ifa, the shape should (None, None, head_size)
+        kv_cache_shape = (None, None, None, head_size)
+
+        kv_cache_dtype = self.config.param_dtype
+
+        num_layers = self.config.num_hidden_layers
+
+        dyn_key_cache = Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        dyn_value_cache = Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        dyn_key_caches = mutable([dyn_key_cache for _ in range(num_layers)])
+        dyn_value_caches = mutable([dyn_value_cache for _ in range(num_layers)])
+
+        dyn_out_cache_loc = Tensor(
+            shape=[
+                None,
+            ],
+            dtype=dtype.int32,
+        )
+        dynamic_attention_mask = Tensor(
+            shape=[None, None], dtype=self.config.param_dtype
+        )
+        dyn_batch_valid_length = Tensor(
+            shape=[
+                None,
+            ],
+            dtype=dtype.int32,
+        )
+        dyn_q_seq_lens = Tensor(
+            shape=[
+                None,
+            ],
+            dtype=dtype.int32,
+        )
+        dyn_block_tables = Tensor(shape=[None, None], dtype=dtype.int32)
+
+        target_hidden_size = self.config.hidden_size
+        if hasattr(self.config, "target_hidden_size"):
+            target_hidden_size = self.config.target_hidden_size
+
+        dyn_hidden_states = Tensor(
+            shape=[None, target_hidden_size], dtype=self.config.param_dtype
+        )
+
+        # Explicitly define the inputs order for set_inputs to match construct signature
+        self.set_inputs(
+            input_ids=dyn_input_ids,
+            position_ids=dyn_position_ids,
+            attention_mask=dynamic_attention_mask,
+            batch_valid_length=dyn_batch_valid_length,
+            is_prefill=is_prefill,
+            q_seq_lens=dyn_q_seq_lens,
+            key_cache=dyn_key_caches,
+            value_cache=dyn_value_caches,
+            out_cache_loc=dyn_out_cache_loc,
+            block_tables=dyn_block_tables,
+            hidden_states=dyn_hidden_states,
+        )
+
+    def construct(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        batch_valid_length,
+        is_prefill,
+        q_seq_lens,
+        key_cache,
+        value_cache,
+        out_cache_loc,
+        block_tables,
+        hidden_states=None,
+        capture_hidden_mode=None,
+        forward_mode=None,
+    ) -> Tensor:
+        """
+        Explicit construct method to ensure parameter alignment with set_inputs.
+        """
+        print(f"[LlamaForCausalLMEagle3] construct called. is_prefill={is_prefill}")
+        if hidden_states is not None:
+            print(
+                f"[LlamaForCausalLMEagle3] hidden_states shape: {hidden_states.shape}"
+            )
+            # Print first few elements to check for corruption
+            # if hidden_states.shape[0] > 0:
+            #    print(f"[LlamaForCausalLMEagle3] hidden_states[0, :5]: {hidden_states[0, :5]}")
+
+        if self.prev_prefill != is_prefill:
+            self.set_model_inputs(is_prefill)
+        self.prev_prefill = is_prefill
+
+        if is_prefill:
+            self.model.phase = "prefill"
+        else:
+            self.model.phase = "increment"
+
+        print(
+            f"DEBUG: hidden_states passed to self.model: {hidden_states.shape if hidden_states is not None else 'None'}"
+        )
+
+        # Call the underlying model
+        hidden_states_out, aux_hidden_states = self.model(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            batch_valid_length=batch_valid_length,
+            is_prefill=is_prefill,
+            q_seq_lens=q_seq_lens,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            out_cache_loc=out_cache_loc,
+            block_tables=block_tables,
+        )
+
+        print(f"DEBUG: hidden_states_out shape: {hidden_states_out.shape}")
+        # print(f"DEBUG: aux_hidden_states type: {type(aux_hidden_states)}, len: {len(aux_hidden_states) if isinstance(aux_hidden_states, (list, tuple)) else 'N/A'}")
+
+        if self.capture_aux_hidden_states:
+            # Logic from Qwen3ForCausalLM.construct for handling aux_hidden_states
+            if capture_hidden_mode is not None and capture_hidden_mode.need_capture():
+                if capture_hidden_mode.is_full():
+                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
+                elif capture_hidden_mode.is_last():
+                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
+                    aux_hidden_states = mint.index_select(
+                        aux_hidden_states, 0, mint.cumsum(q_seq_lens, 0) - 1
+                    )
+                else:
+                    assert False, "Unsupported capture hidden mode"
+
+        # Logic from Qwen3ForCausalLM.construct for logits
+        # TODO: In pure decode scenarios, cumsum and gather operations will be redundant .
+        q_seq_lens_cumsum = mint.cumsum(q_seq_lens, 0)
+
+        print(f"DEBUG: q_seq_lens: {q_seq_lens}")
+        # print(f"DEBUG: forward_mode: {forward_mode}")
+
+        if forward_mode is not None and not forward_mode.is_target_verify():
+            hidden_states_out = mint.index_select(
+                hidden_states_out, 0, q_seq_lens_cumsum - 1
+            )
+        elif forward_mode is None:
+            # Fallback if forward_mode is missing (e.g. during simple tests)
+            # Assume we need last token logic for generation
+            hidden_states_out = mint.index_select(
+                hidden_states_out, 0, q_seq_lens_cumsum - 1
+            )
+
+        logits = self.lm_head(hidden_states_out)
+        if self.tp_size:
+            logits = self.all_gather(logits)
+        logits = mint.reshape(logits, (-1, logits.shape[-1]))
+
+        if self.capture_aux_hidden_states:
+            return logits, aux_hidden_states
+        else:
+            return logits
 
 
 EntryClass = [LlamaForCausalLMEagle3]

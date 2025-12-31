@@ -4,8 +4,6 @@ import sglang as sgl
 
 os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
 os.environ["ASCEND_LAUNCH_BLOCKING"] = "1"
-os.environ["SGL_EAGLE3_DEBUG"] = "1"
-os.environ["SGLANG_EAGLE3_DEBUG"] = "1"
 
 
 def main():
@@ -34,7 +32,7 @@ def main():
         "what is mindspore?",
     ]
 
-    sampling_params = {"temperature": 0, "top_p": 1.0, "max_new_tokens": 128}
+    sampling_params = {"temperature": 0, "top_p": 1.0, "max_new_tokens": 5}
 
     outputs = llm.generate(prompts, sampling_params)
     for prompt, output in zip(prompts, outputs):
