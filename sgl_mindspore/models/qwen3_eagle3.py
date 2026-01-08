@@ -17,11 +17,13 @@ from mindspore import Tensor, dtype, jit, mint, mutable, nn, ops
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 from sgl_mindspore.layers import (
     ColParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RMSNorm,
     VocabParallelEmbedding,
 )
@@ -128,7 +130,7 @@ class Qwen3ModelEagle3(nn.Cell):
         else:
             self.hidden_size_in = config.hidden_size
 
-        self.fc = ColParallelLinear(
+        self.fc = ReplicatedLinear(
             input_size=self.hidden_size_in * 3,
             output_size=config.hidden_size,
             bias=getattr(config, "bias", False),
@@ -234,7 +236,7 @@ class LlamaForCausalLMEagle3(Qwen3ForCausalLM):
         self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        param_dict = self.parameters_dict()
+        params_dict = self.parameters_dict()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -244,21 +246,11 @@ class LlamaForCausalLMEagle3(Qwen3ForCausalLM):
             (".gate_up_proj", ".up_proj", "up"),
         ]
 
-        direct_params_mapping = [
-            (".self_attn.o_proj", ".self_attn.o_proj"),
-            (".mlp.down_proj", ".mlp.down_proj"),
-            (".hidden_norm", ".hidden_norm"),
-            (".input_layernorm", ".input_layernorm"),
-            (".post_attention_layernorm", ".post_attention_layernorm"),
-            (".norm", ".norm"),
-            (".fc", ".fc"),
-        ]
-
-        for name, weight in weights:
+        for name, loaded_weight in weights:
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
-                weight = tensor_torch2ms(weight).move_to("Ascend")
-                self.hot_token_id = weight + mint.arange(weight.shape[0])
+                loaded_weight = tensor_torch2ms(loaded_weight).move_to("Ascend")
+                self.hot_token_id = loaded_weight + mint.arange(loaded_weight.shape[0])
                 continue
 
             if "t2d" in name:
@@ -267,25 +259,27 @@ class LlamaForCausalLMEagle3(Qwen3ForCausalLM):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                mapped_name = name.replace(weight_name, param_name)
-                if not mapped_name.startswith("model."):
-                    mapped_name = "model." + mapped_name
-                if mapped_name in param_dict:
-                    param = param_dict[mapped_name]
+                name = name.replace(weight_name, param_name)
+                param_name = f"model.{name}" if name not in params_dict else name
+                if param_name in params_dict:
+                    param = params_dict[param_name]
                     assert hasattr(param, "weight_load")
                     weight_load = getattr(param, "weight_load")
-                    weight_load(param, weight, shard_id)
+                    weight_load(param, loaded_weight, shard_id)
                     param.set_data(param.move_to("Ascend"))
                     break
             else:
-                if name in param_dict:
-                    param = param_dict[name]
+                param_name = name if name in params_dict else f"model.{name}"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
                     if hasattr(param, "weight_load"):
-                        weight_load = getattr(param, "weight_load")
-                        weight_load(param, weight)
+                        weight_load = getattr(
+                            param, "weight_load", default_weight_loader
+                        )
+                        weight_load(param, loaded_weight)
                         param.set_data(param.move_to("Ascend"))
                     else:
-                        param.set_data(tensor_torch2ms(weight).move_to("Ascend"))
+                        param.set_data(tensor_torch2ms(loaded_weight).move_to("Ascend"))
                     # Make sure the weight is loaded on device, so the kv cache calculation is correct.
 
     def get_hot_token_id(self):
