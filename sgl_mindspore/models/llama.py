@@ -96,8 +96,15 @@ class LlamaAttention(nn.Cell):
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % self.tp_size == 0
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.total_num_kv_heads = config.num_key_value_heads
+        if self.total_num_kv_heads >= self.tp_size:
+            assert self.total_num_kv_heads % self.tp_size == 0
+        else:
+            assert self.tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
         if hasattr(config, "head_dim"):
             self.head_dim = config.head_dim
         else:
@@ -118,23 +125,23 @@ class LlamaAttention(nn.Cell):
             self.rope_type = "default_rope"
 
         self.attn = MsNativeAttnBackend(
-            config.num_attention_heads // self.tp_size,
-            config.head_dim,
-            config.num_key_value_heads // self.tp_size,
+            self.num_heads,
+            self.head_dim,
+            self.num_kv_heads,
         )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=self.hidden_size,
             head_dim=self.head_dim,
-            total_num_heads=self.num_heads,
-            total_num_kv_heads=self.num_kv_heads,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
             bias=config.attention_bias,
             param_dtype=self.param_dtype,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
-            input_size=self.q_size,
+            input_size=self.total_num_heads * self.head_dim,
             output_size=self.hidden_size,
             param_dtype=self.param_dtype,
             bias=config.attention_bias,
@@ -180,16 +187,16 @@ class LlamaAttention(nn.Cell):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split(
             [
-                self.q_size // self.tp_size,
-                self.kv_size // self.tp_size,
-                self.kv_size // self.tp_size,
+                self.q_size,
+                self.kv_size,
+                self.kv_size,
             ],
             dim=-1,
         )
 
-        q = q.view(-1, self.head_dim).contiguous()
-        k = k.view(-1, self.head_dim).contiguous()
-        v = v.view(-1, self.kv_size // self.tp_size).contiguous()
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
         q, k = self.rotary_emb(
             positions,
@@ -210,7 +217,15 @@ class LlamaAttention(nn.Cell):
 
         if is_prefill:
             attn_output = self.attn.extend(
-                q, k, v, attn_mask, None, None, None, q_seq_lens, batch_valid_length
+                q,
+                k,
+                v,
+                attn_mask,
+                None,
+                None,
+                None,
+                batch_valid_length,
+                batch_valid_length,
             )
         else:
             attn_output = self.attn.decode(
