@@ -85,6 +85,17 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
 
+        # Eagle3: handle batch size mismatch for static graph compilation
+        # In Eagle3, embeds and hidden_states can have different batch sizes.
+        # For static graph compilation, we need to align their batch dimensions before concat.
+        # This preserves model semantics while allowing shape inference to work.
+        if embeds.shape[0] != hidden_states.shape[0]:
+            # Align to the smaller batch size to avoid shape mismatch in static graph
+            if embeds.shape[0] < hidden_states.shape[0]:
+                hidden_states = hidden_states[: embeds.shape[0], :]
+            else:
+                embeds = embeds[: hidden_states.shape[0], :]
+
         hidden_states = mint.cat([embeds, hidden_states], dim=-1)
         # Self Attention
         hidden_states = self.self_attn(
@@ -231,7 +242,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-
+        self.lm_head.construct = jit(self.lm_head.construct)
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
@@ -284,6 +295,68 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
+
+    def set_model_inputs(self, is_prefill):
+        dyn_input_ids = Tensor(shape=[None], dtype=dtype.int32)
+        dyn_position_ids = Tensor(shape=[None], dtype=dtype.int64)
+
+        head_size = self.config.head_dim
+        # use pa, if use ifa, shape should (None, None, head_size)
+        kv_cache_shape = (None, None, None, head_size)
+
+        kv_cache_dtype = self.config.param_dtype
+
+        # Eagle3 has only 1 layer
+        num_layers = 1
+
+        dyn_key_cache = Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        dyn_value_cache = Tensor(shape=kv_cache_shape, dtype=kv_cache_dtype)
+        dyn_key_caches = mutable([dyn_key_cache for _ in range(num_layers)])
+        dyn_value_caches = mutable([dyn_value_cache for _ in range(num_layers)])
+
+        dyn_out_cache_loc = Tensor(
+            shape=[
+                None,
+            ],
+            dtype=dtype.int32,
+        )
+        dynamic_attention_mask = Tensor(
+            shape=[None, None], dtype=self.config.param_dtype
+        )
+        dyn_batch_valid_length = Tensor(
+            shape=[
+                None,
+            ],
+            dtype=dtype.int32,
+        )
+        dyn_q_seq_lens = Tensor(
+            shape=[
+                None,
+            ],
+            dtype=dtype.int32,
+        )
+        dyn_block_tables = Tensor(shape=[None, None], dtype=dtype.int32)
+
+        # For Eagle3, hidden_states can have different batch sizes from embeds
+        # Use dynamic shapes for hidden_states (which is passed in)
+        dyn_hidden_states = Tensor(shape=[None, None], dtype=self.config.param_dtype)
+
+        # Set inputs for main model
+        # Note: embeds is generated internally from input_ids in construct,
+        # so we don't need to declare it separately in set_inputs
+        self.model.set_inputs(
+            input_ids=dyn_input_ids,
+            hidden_states=dyn_hidden_states,
+            position_ids=dyn_position_ids,
+            attention_mask=dynamic_attention_mask,
+            batch_valid_length=dyn_batch_valid_length,
+            is_prefill=is_prefill,
+            q_seq_lens=dyn_q_seq_lens,
+            key_cache=dyn_key_caches,
+            value_cache=dyn_value_caches,
+            out_cache_loc=dyn_out_cache_loc,
+            block_tables=dyn_block_tables,
+        )
 
     def prepare_inputs(self, forward_batch: ForwardBatch, model_inputs: Dict[str, Any]):
         if forward_batch.spec_info:
