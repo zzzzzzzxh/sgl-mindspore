@@ -64,6 +64,7 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
             param_dtype=config.param_dtype,
         )
 
+    @jit
     def construct(
         self,
         embeds: Tensor,
@@ -84,17 +85,6 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
-
-        # Eagle3: handle batch size mismatch for static graph compilation
-        # In Eagle3, embeds and hidden_states can have different batch sizes.
-        # For static graph compilation, we need to align their batch dimensions before concat.
-        # This preserves model semantics while allowing shape inference to work.
-        if embeds.shape[0] != hidden_states.shape[0]:
-            # Align to the smaller batch size to avoid shape mismatch in static graph
-            if embeds.shape[0] < hidden_states.shape[0]:
-                hidden_states = hidden_states[: embeds.shape[0], :]
-            else:
-                embeds = embeds[: hidden_states.shape[0], :]
 
         hidden_states = mint.cat([embeds, hidden_states], dim=-1)
         # Self Attention
@@ -158,6 +148,7 @@ class LlamaModelEagle3(nn.Cell):
             param_dtype=config.param_dtype,
         )
 
+    @jit
     def construct(
         self,
         input_ids,
