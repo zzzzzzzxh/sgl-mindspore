@@ -49,6 +49,180 @@ def get_model_context(key):
     return _eagle3_model_context[key]
 
 
+class LlamaAttentionEagle3(nn.Cell):
+    """EAGLE-3 specialized attention that uses model context instead of is_prefill parameter.
+
+    This avoids control flow splitting in static graph compilation by getting is_prefill
+    from model context rather than as a function parameter.
+    """
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.hidden_size = config.hidden_size
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % self.tp_size == 0
+        self.num_heads = self.total_num_heads // self.tp_size
+        self.total_num_kv_heads = config.num_key_value_heads
+        if self.total_num_kv_heads >= self.tp_size:
+            assert self.total_num_kv_heads % self.tp_size == 0
+        else:
+            assert self.tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
+        else:
+            self.head_dim = config.hidden_size // self.num_heads
+        self.q_size = self.head_dim * self.num_heads
+        self.kv_size = self.head_dim * self.num_kv_heads
+        self.scaling = float(self.head_dim**-0.5)
+        self.rope_theta = int(config.rope_theta)
+        self.param_dtype = config.param_dtype
+        self.max_position = config.max_position_embeddings
+        if config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling["rope_type"]
+            self.rope_factor = config.rope_scaling["factor"]
+            self.rope_max_position_embeddings = config.rope_scaling[
+                "original_max_position_embeddings"
+            ]
+        else:
+            self.rope_type = "default_rope"
+
+        from sgl_mindspore.layers import (
+            BaseRotaryEmbedding,
+            MsNativeAttnBackend,
+            QKVParallelLinear,
+            RowParallelLinear,
+            YaRNScalingRotaryEmbedding,
+        )
+
+        self.attn = MsNativeAttnBackend(
+            self.num_heads,
+            self.head_dim,
+            self.num_kv_heads,
+        )
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.hidden_size,
+            head_dim=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=config.attention_bias,
+            param_dtype=self.param_dtype,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+        self.o_proj = RowParallelLinear(
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=self.hidden_size,
+            param_dtype=self.param_dtype,
+            bias=config.attention_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+        )
+        self.rotary_emb = None
+        if self.rope_type == "yarn":
+            self.rotary_emb = YaRNScalingRotaryEmbedding(
+                head_size=self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position_embeddings=self.rope_max_position_embeddings,
+                base=self.rope_theta,
+                is_neox_style=True,
+                scaling_factor=self.rope_factor,
+                dtype=self.param_dtype,
+            )
+        else:
+            self.rotary_emb = BaseRotaryEmbedding(
+                head_size=self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position_embeddings=self.max_position,
+                base=self.rope_theta,
+                dtype=self.param_dtype,
+            )
+
+    def construct(
+        self,
+        hidden_states: Tensor,
+        positions: Tensor,
+        batch_valid_length: Tensor,
+        layer_idx: int,
+        attn_mask: Tensor,
+        q_seq_lens: Tensor,
+        key_cache: Tensor,
+        value_cache: Tensor,
+        out_cache_loc: Tensor,
+        block_tables: Tensor,
+    ) -> Tensor:
+        """Construct method that gets is_prefill from model context instead of parameter."""
+        token_lens, hidden_dim = hidden_states.shape
+
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split(
+            [
+                self.q_size,
+                self.kv_size,
+                self.kv_size,
+            ],
+            dim=-1,
+        )
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        # Get is_prefill from model context to avoid control flow splitting
+        is_prefill = get_model_context("is_prefill")
+
+        q, k = self.rotary_emb(
+            positions,
+            q,
+            k,
+            batch_valid_length=batch_valid_length,
+            is_prefill=is_prefill,
+        )
+
+        key_out = self.attn(
+            k,
+            v,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            out_cache_loc=out_cache_loc,
+        )
+        q = ops.depend(q, key_out)
+
+        if is_prefill:
+            attn_output = self.attn.extend(
+                q,
+                k,
+                v,
+                attn_mask,
+                None,
+                None,
+                None,
+                batch_valid_length,
+                batch_valid_length,
+            )
+        else:
+            attn_output = self.attn.decode(
+                q,
+                batch_valid_length,
+                attn_mask,
+                q_seq_lens,
+                key_cache,
+                value_cache,
+                block_tables,
+            )
+
+        output = self.o_proj(attn_output).view(token_lens, -1)
+        return output
+
+
 class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
     def __init__(
         self,
@@ -59,16 +233,11 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, quant_config, prefix)
 
-        # override qkv
-        self.self_attn.qkv_proj = QKVParallelLinear(
-            2 * self.hidden_size,
-            self.self_attn.head_dim,
-            self.self_attn.total_num_heads,
-            self.self_attn.total_num_kv_heads,
-            bias=False,
-            param_dtype=config.param_dtype,
+        # Replace self_attn with LlamaAttentionEagle3
+        self.self_attn = LlamaAttentionEagle3(
+            config=config,
             quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = LlamaMLP(config, quant_config, prefix)
 
@@ -94,8 +263,6 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
         block_tables: Tensor,
     ) -> Tuple[Tensor, Tensor]:
 
-        is_prefill = get_model_context("is_prefill")
-
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -106,7 +273,6 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
             hidden_states=hidden_states,
             positions=positions,
             batch_valid_length=batch_valid_length,
-            is_prefill=is_prefill,
             layer_idx=layer_idx,
             attn_mask=attn_mask,
             q_seq_lens=q_seq_lens,
