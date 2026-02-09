@@ -34,6 +34,20 @@ logger = logging.getLogger(__name__)
 
 LlamaConfig = None
 
+# Model context for static graph compilation
+_eagle3_model_context = {"is_prefill": True}
+
+
+def set_model_context(key, value):
+    """Set model context variable for static graph compilation."""
+    global _eagle3_model_context
+    _eagle3_model_context[key] = value
+
+
+def get_model_context(key):
+    """Get model context variable for static graph compilation."""
+    return _eagle3_model_context[key]
+
 
 class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
     def __init__(
@@ -64,7 +78,6 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
             param_dtype=config.param_dtype,
         )
 
-    @jit
     def construct(
         self,
         embeds: Tensor,
@@ -72,7 +85,6 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
         residual: Tensor,
         positions: Tensor,
         batch_valid_length: Tensor,
-        is_prefill: bool,
         layer_idx: int,
         attn_mask: Tensor,
         q_seq_lens: Tensor,
@@ -81,6 +93,8 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
         out_cache_loc: Tensor,
         block_tables: Tensor,
     ) -> Tuple[Tensor, Tensor]:
+
+        is_prefill = get_model_context("is_prefill")
 
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
@@ -148,7 +162,6 @@ class LlamaModelEagle3(nn.Cell):
             param_dtype=config.param_dtype,
         )
 
-    @jit
     def construct(
         self,
         input_ids,
@@ -156,7 +169,6 @@ class LlamaModelEagle3(nn.Cell):
         position_ids=None,
         attention_mask=None,
         batch_valid_length=None,
-        is_prefill=True,
         q_seq_lens=None,
         key_cache=None,
         value_cache=None,
@@ -178,7 +190,6 @@ class LlamaModelEagle3(nn.Cell):
             residual=residual,
             positions=position_ids,
             batch_valid_length=batch_valid_length,
-            is_prefill=is_prefill,
             layer_idx=0,
             attn_mask=attention_mask,
             q_seq_lens=q_seq_lens,
@@ -236,6 +247,65 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.lm_head.construct = jit(self.lm_head.construct)
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
+
+        # Initialize static graph compilation for EAGLE3
+        self.prefill_graph = None
+        self.decode_graph = None
+        self.set_flags = False
+
+    def construct(self, **model_inputs) -> Tensor:
+        """Override construct to use exec_model for separate prefill/decode graphs."""
+        # Extract parameters needed for post-processing
+        q_seq_lens = model_inputs.get("q_seq_lens")
+        is_prefill = model_inputs.get("is_prefill", True)
+        capture_hidden_mode = None
+        if "capture_hidden_mode" in model_inputs:
+            capture_hidden_mode = model_inputs.pop("capture_hidden_mode")
+        forward_mode = None
+        if "forward_mode" in model_inputs:
+            forward_mode = model_inputs.pop("forward_mode")
+
+        # Call exec_model for the core forward pass
+        model_output = self.exec_model(**model_inputs)
+
+        # Handle EAGLE3 output format
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = model_output
+            # Post-process aux hidden states
+            if capture_hidden_mode and capture_hidden_mode.need_capture():
+                if capture_hidden_mode.is_full():
+                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
+                elif capture_hidden_mode.is_last():
+                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
+                    aux_hidden_states = mint.index_select(
+                        aux_hidden_states, 0, mint.cumsum(q_seq_lens, 0) - 1
+                    )
+                else:
+                    assert False, "Unsupported capture hidden mode"
+        else:
+            hidden_states = model_output
+            aux_hidden_states = None
+
+        # Select last token for logits
+        if q_seq_lens is not None:
+            q_seq_lens = mint.cumsum(q_seq_lens, 0)
+            if forward_mode is None or not (
+                forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+            ):
+                # In target verify mode, all tokens' logits are needed.
+                hidden_states = mint.index_select(hidden_states, 0, q_seq_lens - 1)
+
+        # Compute logits
+        logits = self.lm_head(hidden_states)
+        if self.tp_size:
+            logits = self.all_gather(logits)
+        logits = mint.reshape(logits, (-1, logits.shape[-1]))
+
+        # Return with aux hidden states if captured
+        if self.capture_aux_hidden_states:
+            return logits, aux_hidden_states
+        else:
+            return logits
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = self.parameters_dict()
@@ -341,7 +411,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             position_ids=dyn_position_ids,
             attention_mask=dynamic_attention_mask,
             batch_valid_length=dyn_batch_valid_length,
-            is_prefill=is_prefill,
             q_seq_lens=dyn_q_seq_lens,
             key_cache=dyn_key_caches,
             value_cache=dyn_value_caches,
@@ -357,6 +426,44 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         if forward_batch.capture_hidden_mode:
             model_inputs["capture_hidden_mode"] = forward_batch.capture_hidden_mode
         return model_inputs
+
+    def exec_model(self, **model_inputs):
+        """Execute model with separate prefill and decode graphs."""
+        is_prefill = model_inputs.get("is_prefill", True)
+
+        # Set model inputs for first compilation
+        if not self.set_flags:
+            self.set_model_inputs(is_prefill)
+            self.set_flags = True
+
+        # Set model context for is_prefill
+        set_model_context("is_prefill", is_prefill)
+
+        # Eager mode (for debugging)
+        # Uncomment to enable eager mode
+        # return self.model(**model_inputs)
+
+        # Remove is_prefill from model_inputs before passing to compiled graph
+        # The compiled graph's construct method doesn't have is_prefill parameter
+        model_inputs_for_graph = {
+            k: v for k, v in model_inputs.items() if k != "is_prefill"
+        }
+
+        # Graph mode: separate compilation for prefill and decode
+        if is_prefill:
+            self.model.phase = "prefill"
+            if self.prefill_graph is None:
+                self.model._set_jit_graph_name("prefill")
+                self.prefill_graph = ms.jit(function=self.model, jit_level="O0")
+            model_output = self.prefill_graph(**model_inputs_for_graph)
+        else:
+            self.model.phase = "increment"
+            if self.decode_graph is None:
+                self.model._set_jit_graph_name("decode")
+                self.decode_graph = ms.jit(function=self.model, jit_level="O0")
+            model_output = self.decode_graph(**model_inputs_for_graph)
+
+        return model_output
 
 
 EntryClass = [LlamaForCausalLMEagle3]
