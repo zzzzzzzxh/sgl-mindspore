@@ -364,16 +364,14 @@ class LlamaForCausalLMEagle3Standalone(LlamaForCausalLM):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+            # Always convert list to tensor, even if capture_hidden_mode is None
+            if isinstance(aux_hidden_states, list):
+                aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
             if capture_hidden_mode is not None and capture_hidden_mode.need_capture():
-                if capture_hidden_mode.is_full():
-                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
-                elif capture_hidden_mode.is_last():
-                    aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
+                if capture_hidden_mode.is_last():
                     aux_hidden_states = mint.index_select(
                         aux_hidden_states, 0, mint.cumsum(q_seq_lens, 0) - 1
                     )
-                else:
-                    assert False, "Unsupported capture hidden mode"
 
         # TODO: In pure decode scenarios, cumsum and gather operations will be redundant .
         q_seq_lens = mint.cumsum(q_seq_lens, 0)
