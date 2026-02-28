@@ -338,6 +338,7 @@ class LlamaForCausalLMEagle3Standalone(LlamaForCausalLM):
     def construct(self, **model_inputs) -> Tensor:
         q_seq_lens = model_inputs["q_seq_lens"]
         is_prefill = model_inputs["is_prefill"]
+        capture_hidden_mode = None
         if "capture_hidden_mode" in model_inputs:
             capture_hidden_mode = model_inputs.pop("capture_hidden_mode")
         if "forward_mode" in model_inputs:
@@ -360,9 +361,10 @@ class LlamaForCausalLMEagle3Standalone(LlamaForCausalLM):
         model_inputs["hidden_states"] = hidden_states
         hidden_states = self.model(**model_inputs)
 
+        aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-            if capture_hidden_mode.need_capture():
+            if capture_hidden_mode is not None and capture_hidden_mode.need_capture():
                 if capture_hidden_mode.is_full():
                     aux_hidden_states = mint.cat(aux_hidden_states, dim=-1)
                 elif capture_hidden_mode.is_last():
@@ -375,7 +377,9 @@ class LlamaForCausalLMEagle3Standalone(LlamaForCausalLM):
 
         # TODO: In pure decode scenarios, cumsum and gather operations will be redundant .
         q_seq_lens = mint.cumsum(q_seq_lens, 0)
-        if not (forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()):
+        if forward_mode is None or not (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
             # In target verify mode, all tokens' logits are needed.
             hidden_states = mint.index_select(hidden_states, 0, q_seq_lens - 1)
 
