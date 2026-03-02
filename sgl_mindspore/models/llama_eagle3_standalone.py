@@ -400,27 +400,8 @@ class LlamaForCausalLMEagle3Standalone(LlamaForCausalLM):
             model_inputs["hidden_states"] = tensor_torch2ms(
                 forward_batch.spec_info.hidden_states
             )
-        else:
-            # Standalone mode: generate hidden_states from embeddings
-            # Need to process input_ids through embed_tokens first
-            input_ids = model_inputs["input_ids"]
-            embeds = self.model.embed_tokens(input_ids)
-
-            # Triple the embeddings to match EAGLE3's expected input size
-            # embeds.shape could be [batch, seq_len, hidden_size] or [total_tokens, hidden_size]
-            if len(embeds.shape) == 3:
-                # Prefill: [bs, seq_len, hidden_size]
-                embeds_tripled = mint.concat([embeds, embeds, embeds], dim=-1)
-            else:
-                # Decode: [total_tokens, hidden_size]
-                embeds_tripled = mint.concat([embeds, embeds, embeds], dim=-1)
-
-            # Apply FC to generate hidden_states
-            hidden_states = self.fc(embeds_tripled)
-            model_inputs["hidden_states"] = hidden_states
-
-        if forward_batch.capture_hidden_mode:
-            model_inputs["capture_hidden_mode"] = forward_batch.capture_hidden_mode
+        # For standalone mode: hidden_states will be generated in construct method
+        # We just set a flag to indicate standalone mode
         return model_inputs
 
 
