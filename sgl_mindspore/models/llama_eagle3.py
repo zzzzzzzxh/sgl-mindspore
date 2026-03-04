@@ -9,6 +9,7 @@ https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama_e
 """
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import mindspore as ms
@@ -80,7 +81,6 @@ class LlamaDecoderLayerEagle3(LlamaDecoderLayer):
         out_cache_loc: Tensor,
         block_tables: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -138,6 +138,49 @@ class LlamaModelEagle3(nn.Cell):
             param_dtype=config.param_dtype,
         )
 
+        # For tensor loading (comparison experiment)
+        self.load_tensors = os.environ.get("MS_LOAD_TENSORS", "0") == "1"
+        self.load_dir = os.environ.get("MS_LOAD_DIR", "/tmp/sglang_tensors")
+        self.forward_count = 0
+        self.loaded_tensors = {}
+
+        if self.load_tensors:
+            self._load_tensors_from_sglang()
+
+    def _load_tensors_from_sglang(self):
+        """Load tensors saved from sglang for comparison"""
+        forward_dir = os.path.join(self.load_dir, "forward_0")
+        inputs_dir = os.path.join(forward_dir, "inputs")
+
+        if not os.path.exists(inputs_dir):
+            print(f"[MS] Warning: No saved tensors found at {inputs_dir}")
+            return
+
+        # Load all input tensors
+        tensor_files = {
+            "input_ids": "input_ids.pt",
+            "positions": "positions.pt",
+            "embeds": "embeds.pt",
+            "hidden_states_before_fc": "hidden_states_before_fc.pt",
+            "hidden_states_after_fc": "hidden_states_after_fc.pt",
+            "forward_batch_info": "forward_batch_info.pt",
+        }
+
+        for key, filename in tensor_files.items():
+            filepath = os.path.join(inputs_dir, filename)
+            if os.path.exists(filepath):
+                # Load torch tensor and convert to mindspore
+                torch_tensor = torch.load(filepath, map_location="cpu")
+                ms_tensor = tensor_torch2ms(torch_tensor)
+                self.loaded_tensors[key] = ms_tensor
+                print(
+                    f"[MS] Loaded {key}: shape={ms_tensor.shape}, dtype={ms_tensor.dtype}"
+                )
+            else:
+                print(f"[MS] Warning: {filename} not found, skipping")
+
+        print(f"[MS] Total loaded {len(self.loaded_tensors)} tensors from sglang")
+
     @jit
     def construct(
         self,
@@ -153,9 +196,54 @@ class LlamaModelEagle3(nn.Cell):
         out_cache_loc=None,
         block_tables=None,
     ):
+        # Force use loaded tensors if enabled
+        if self.load_tensors and len(self.loaded_tensors) > 0:
+            print(
+                f"[MS] Using loaded tensors from sglang (forward {self.forward_count})"
+            )
+
+            # Override input_ids
+            if "input_ids" in self.loaded_tensors:
+                input_ids = self.loaded_tensors["input_ids"]
+                print(f"[MS] Overriding input_ids: shape={input_ids.shape}")
+
+            # Override positions
+            if "positions" in self.loaded_tensors:
+                position_ids = self.loaded_tensors["positions"]
+                print(f"[MS] Overriding position_ids: shape={position_ids.shape}")
+
+            # Override hidden_states (before fc projection)
+            if "hidden_states_before_fc" in self.loaded_tensors:
+                hidden_states = self.loaded_tensors["hidden_states_before_fc"]
+                print(
+                    f"[MS] Overriding hidden_states_before_fc: shape={hidden_states.shape}"
+                )
+
         embeds = self.embed_tokens(input_ids)
 
+        # Override embeds if loaded
+        if self.load_tensors and "embeds" in self.loaded_tensors:
+            embeds = self.loaded_tensors["embeds"]
+            print(f"[MS] Overriding embeds: shape={embeds.shape}")
+
         residual = None
+
+        # Apply fc projection if needed
+        if (
+            hidden_states is not None
+            and hidden_states.shape[-1] != self.config.hidden_size
+        ):
+            # Note: fc is in LlamaForCausalLMEagle3, so we skip here
+            # The fc projection will be handled in LlamaForCausalLMEagle3.construct
+            pass
+
+        # Override hidden_states after fc if loaded
+        if self.load_tensors and "hidden_states_after_fc" in self.loaded_tensors:
+            hidden_states = self.loaded_tensors["hidden_states_after_fc"]
+            print(
+                f"[MS] Overriding hidden_states_after_fc: shape={hidden_states.shape}"
+            )
+
         hidden_states, residual = self.midlayer(
             embeds=embeds,
             hidden_states=hidden_states,
@@ -175,6 +263,10 @@ class LlamaModelEagle3(nn.Cell):
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
+
+        # Increment forward count
+        if self.load_tensors:
+            self.forward_count += 1
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
@@ -229,6 +321,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
         )
+
+        # For output comparison
+        self.save_outputs = os.environ.get("MS_SAVE_OUTPUTS", "0") == "1"
+        self.load_dir = os.environ.get("MS_LOAD_DIR", "/tmp/sglang_tensors")
+        self.forward_count = 0
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = self.parameters_dict()
@@ -384,6 +481,30 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         if self.tp_size:
             logits = self.all_gather(logits)
         logits = mint.reshape(logits, (-1, logits.shape[-1]))
+
+        # Save outputs for comparison if enabled (only first forward pass)
+        if self.save_outputs and self.forward_count == 0:
+            outputs_dir = os.path.join(
+                self.load_dir, f"forward_{self.forward_count}", "outputs_ms"
+            )
+            os.makedirs(outputs_dir, exist_ok=True)
+
+            # Convert to torch for saving
+            import numpy as np
+
+            logits_np = logits.asnumpy()
+            logits_torch = torch.from_numpy(logits_np)
+            torch.save(logits_torch, os.path.join(outputs_dir, "logits.pt"))
+            print(f"[MS] Saved logits: shape={logits.shape}")
+
+            if self.capture_aux_hidden_states and aux_hidden_states is not None:
+                aux_np = aux_hidden_states.asnumpy()
+                aux_torch = torch.from_numpy(aux_np)
+                torch.save(aux_torch, os.path.join(outputs_dir, "aux_hidden_states.pt"))
+                print(f"[MS] Saved aux_hidden_states: shape={aux_hidden_states.shape}")
+
+            self.forward_count += 1
+            print(f"[MS] Completed output saving for forward pass {self.forward_count}")
 
         if self.capture_aux_hidden_states:
             return logits, aux_hidden_states
