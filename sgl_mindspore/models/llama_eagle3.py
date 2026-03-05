@@ -502,18 +502,33 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             os.makedirs(outputs_dir, exist_ok=True)
 
             # Convert to torch for saving
+            # Note: bfloat16 numpy arrays can't be directly converted via from_numpy
+            # So we convert to float32 first, then save with original dtype info
             import numpy as np
 
             logits_np = logits.asnumpy()
-            logits_torch = torch.from_numpy(logits_np)
+            # Store original dtype and convert to float32 for torch conversion
+            logits_dtype = str(logits_np.dtype)
+            if logits_np.dtype == np.bfloat16:
+                logits_np_float = logits_np.astype(np.float32)
+                logits_torch = torch.from_numpy(logits_np_float).to(torch.bfloat16)
+            else:
+                logits_torch = torch.from_numpy(logits_np)
             torch.save(logits_torch, os.path.join(outputs_dir, "logits.pt"))
-            print(f"[MS] Saved logits: shape={logits.shape}")
+            print(f"[MS] Saved logits: shape={logits.shape}, dtype={logits_dtype}")
 
             if self.capture_aux_hidden_states and aux_hidden_states is not None:
                 aux_np = aux_hidden_states.asnumpy()
-                aux_torch = torch.from_numpy(aux_np)
+                aux_dtype = str(aux_np.dtype)
+                if aux_np.dtype == np.bfloat16:
+                    aux_np_float = aux_np.astype(np.float32)
+                    aux_torch = torch.from_numpy(aux_np_float).to(torch.bfloat16)
+                else:
+                    aux_torch = torch.from_numpy(aux_np)
                 torch.save(aux_torch, os.path.join(outputs_dir, "aux_hidden_states.pt"))
-                print(f"[MS] Saved aux_hidden_states: shape={aux_hidden_states.shape}")
+                print(
+                    f"[MS] Saved aux_hidden_states: shape={aux_hidden_states.shape}, dtype={aux_dtype}"
+                )
 
             self.forward_count += 1
             print(f"[MS] Completed output saving for forward pass {self.forward_count}")
