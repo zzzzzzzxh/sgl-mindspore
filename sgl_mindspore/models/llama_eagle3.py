@@ -509,7 +509,8 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             logits_np = logits.asnumpy()
             # Store original dtype and convert to float32 for torch conversion
             logits_dtype = str(logits_np.dtype)
-            if logits_np.dtype == np.bfloat16:
+            is_bfloat16 = logits_dtype == "bfloat16" or "bfloat16" in logits_dtype
+            if is_bfloat16:
                 logits_np_float = logits_np.astype(np.float32)
                 logits_torch = torch.from_numpy(logits_np_float).to(torch.bfloat16)
             else:
@@ -520,7 +521,8 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             if self.capture_aux_hidden_states and aux_hidden_states is not None:
                 aux_np = aux_hidden_states.asnumpy()
                 aux_dtype = str(aux_np.dtype)
-                if aux_np.dtype == np.bfloat16:
+                is_aux_bfloat16 = aux_dtype == "bfloat16" or "bfloat16" in aux_dtype
+                if is_aux_bfloat16:
                     aux_np_float = aux_np.astype(np.float32)
                     aux_torch = torch.from_numpy(aux_np_float).to(torch.bfloat16)
                 else:
