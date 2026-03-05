@@ -163,14 +163,15 @@ class LlamaModelEagle3(nn.Cell):
             "embeds": "embeds.pt",
             "hidden_states_before_fc": "hidden_states_before_fc.pt",
             "hidden_states_after_fc": "hidden_states_after_fc.pt",
-            "forward_batch_info": "forward_batch_info.pt",
         }
 
         for key, filename in tensor_files.items():
             filepath = os.path.join(inputs_dir, filename)
             if os.path.exists(filepath):
                 # Load torch tensor and convert to mindspore
-                torch_tensor = torch.load(filepath, map_location="cpu")
+                torch_tensor = torch.load(
+                    filepath, map_location="cpu", weights_only=True
+                )
                 ms_tensor = tensor_torch2ms(torch_tensor)
                 self.loaded_tensors[key] = ms_tensor
                 print(
@@ -178,6 +179,17 @@ class LlamaModelEagle3(nn.Cell):
                 )
             else:
                 print(f"[MS] Warning: {filename} not found, skipping")
+
+        # Load forward_batch_info separately (it's a dict, not a tensor)
+        batch_info_path = os.path.join(inputs_dir, "forward_batch_info.pt")
+        if os.path.exists(batch_info_path):
+            batch_info = torch.load(
+                batch_info_path, map_location="cpu", weights_only=False
+            )
+            self.loaded_tensors["forward_batch_info"] = batch_info
+            print(
+                f"[MS] Loaded forward_batch_info: keys={list(batch_info.keys()) if isinstance(batch_info, dict) else 'not a dict'}"
+            )
 
         print(f"[MS] Total loaded {len(self.loaded_tensors)} tensors from sglang")
 
