@@ -484,17 +484,9 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                     assert False, "Unsupported capture hidden mode"
 
         # TODO: In pure decode scenarios, cumsum and gather operations will be redundant .
-        q_seq_lens = mint.cumsum(q_seq_lens, 0)
-        if not (forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()):
-            # In target verify mode, all tokens' logits are needed.
-            hidden_states = mint.index_select(hidden_states, 0, q_seq_lens - 1)
-
-        logits = self.lm_head(hidden_states)
-        if self.tp_size:
-            logits = self.all_gather(logits)
-        logits = mint.reshape(logits, (-1, logits.shape[-1]))
 
         # Save outputs for comparison if enabled (only first forward pass)
+        # Save BEFORE index_select to match SGLang's hidden_states_to_logits shape
         if self.save_outputs and self.forward_count == 0:
             outputs_dir = os.path.join(
                 self.load_dir, f"forward_{self.forward_count}", "outputs_ms"
@@ -506,17 +498,26 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             # So we convert to float32 first, then save with original dtype info
             import numpy as np
 
-            logits_np = logits.asnumpy()
-            # Store original dtype and convert to float32 for torch conversion
-            logits_dtype = str(logits_np.dtype)
-            is_bfloat16 = logits_dtype == "bfloat16" or "bfloat16" in logits_dtype
-            if is_bfloat16:
-                logits_np_float = logits_np.astype(np.float32)
-                logits_torch = torch.from_numpy(logits_np_float).to(torch.bfloat16)
+            # Save hidden_states BEFORE index_select (same as SGLang's hidden_states_to_logits)
+            hidden_states_np = hidden_states.asnumpy()
+            hidden_states_dtype = str(hidden_states_np.dtype)
+            is_hs_bfloat16 = (
+                hidden_states_dtype == "bfloat16" or "bfloat16" in hidden_states_dtype
+            )
+            if is_hs_bfloat16:
+                hidden_states_np_float = hidden_states_np.astype(np.float32)
+                hidden_states_torch = torch.from_numpy(hidden_states_np_float).to(
+                    torch.bfloat16
+                )
             else:
-                logits_torch = torch.from_numpy(logits_np)
-            torch.save(logits_torch, os.path.join(outputs_dir, "logits.pt"))
-            print(f"[MS] Saved logits: shape={logits.shape}, dtype={logits_dtype}")
+                hidden_states_torch = torch.from_numpy(hidden_states_np)
+            torch.save(
+                hidden_states_torch,
+                os.path.join(outputs_dir, "hidden_states_to_logits.pt"),
+            )
+            print(
+                f"[MS] Saved hidden_states_to_logits: shape={hidden_states.shape}, dtype={hidden_states_dtype}"
+            )
 
             if self.capture_aux_hidden_states and aux_hidden_states is not None:
                 aux_np = aux_hidden_states.asnumpy()
@@ -534,6 +535,16 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
             self.forward_count += 1
             print(f"[MS] Completed output saving for forward pass {self.forward_count}")
+
+        q_seq_lens = mint.cumsum(q_seq_lens, 0)
+        if not (forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()):
+            # In target verify mode, all tokens' logits are needed.
+            hidden_states = mint.index_select(hidden_states, 0, q_seq_lens - 1)
+
+        logits = self.lm_head(hidden_states)
+        if self.tp_size:
+            logits = self.all_gather(logits)
+        logits = mint.reshape(logits, (-1, logits.shape[-1]))
 
         if self.capture_aux_hidden_states:
             return logits, aux_hidden_states
